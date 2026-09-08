@@ -1,0 +1,13 @@
+# generated graph output
+graphify-out/
+
+# bridge runtime state / logs
+*.log
+*.jsonl
+turns/
+
+# node
+node_modules/
+
+# macOS
+.DS_Store
