@@ -20,6 +20,8 @@ Codex runs inside its own sandbox and approval policy.
 - Binds to `127.0.0.1` only.
 - Installs as a Codex *profile* by default, so your existing config is untouched.
 
+**Website:** https://devzahirul.github.io/codex_claude_bridgectl/ (source in `site/`)
+
 ---
 
 ## Contents
