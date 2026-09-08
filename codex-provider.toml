@@ -1,0 +1,16 @@
+# Prefer `bridgectl setup` for profiles, or `bridgectl setup --global` for app mode.
+# If installing manually, put these root keys BEFORE the first TOML [table].
+# Setup also installs claude.models.json and an absolute model_catalog_json path
+# so /model lists the three Claude models; copying this provider alone does not.
+# Start the bridge first:  ./bridgectl start
+# No API key is needed: the bridge binds to 127.0.0.1 and ignores auth, and
+# omitting env_key is what stops codex from demanding an environment variable.
+
+model = "claude-sonnet-5"
+model_provider = "claudebridge"
+model_reasoning_effort = "low"
+
+[model_providers.claudebridge]
+name = "Claude Bridge"
+base_url = "http://127.0.0.1:8787/v1"
+wire_api = "responses"

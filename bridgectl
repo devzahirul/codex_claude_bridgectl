@@ -1,0 +1,598 @@
+#!/usr/bin/env bash
+# bridgectl — set up, run, manage and diagnose the codex ⇄ claude bridge.
+set -uo pipefail
+
+# Resolve symlinks so bridge.mjs is found even when invoked via a PATH symlink.
+_src="${BASH_SOURCE[0]}"
+while [ -L "$_src" ]; do
+  _dir="$(cd "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  case "$_src" in /*) ;; *) _src="$_dir/$_src" ;; esac
+done
+SCRIPT_DIR="$(cd "$(dirname "$_src")" && pwd)"
+BRIDGE_JS="$SCRIPT_DIR/bridge.mjs"
+CATALOG_JS="$SCRIPT_DIR/model-catalog.mjs"
+
+# Explicit paths make setup/diagnostics testable without changing HOME/CODEX_HOME.
+_codex_home_arg=""; _state_dir_arg=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --codex-home) [ $# -ge 2 ] || { echo 'missing --codex-home path' >&2; exit 1; }; _codex_home_arg="$2"; shift 2 ;;
+    --state-dir) [ $# -ge 2 ] || { echo 'missing --state-dir path' >&2; exit 1; }; _state_dir_arg="$2"; shift 2 ;;
+    *) break ;;
+  esac
+done
+
+STATE_DIR="${_state_dir_arg:-${BRIDGE_STATE_DIR:-$HOME/.codex-claude-bridge}}"
+PID_FILE="$STATE_DIR/bridge.pid"
+LOG_FILE="$STATE_DIR/bridge.log"
+ENV_FILE="$STATE_DIR/env"
+
+# Explicit process BRIDGE_* values win over persisted defaults, even when empty.
+_override_names=(); _override_values=()
+for _name in ${!BRIDGE_@}; do
+  _override_names+=("$_name"); _override_values+=("${!_name}")
+done
+[ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }
+for ((_i=0; _i<${#_override_names[@]}; _i++)); do
+  printf -v "${_override_names[$_i]}" '%s' "${_override_values[$_i]}"
+  export "${_override_names[$_i]}"
+done
+unset _override_names _override_values _name _i
+
+CODEX_HOME_DIR="${_codex_home_arg:-${BRIDGE_CODEX_HOME:-${CODEX_HOME:-$HOME/.codex}}}"
+PROFILE_NAME="${BRIDGE_PROFILE_NAME:-claude}"
+PROFILE_FILE="$CODEX_HOME_DIR/$PROFILE_NAME.config.toml"
+CODEX_CONFIG="$CODEX_HOME_DIR/config.toml"
+CLAUDE_CATALOG="$CODEX_HOME_DIR/claude.models.json"
+OPENAI_CATALOG="$CODEX_HOME_DIR/openai.models.json"
+CODEX_BIN="${BRIDGE_CODEX_BIN:-codex}"
+CLAUDE_BIN="${BRIDGE_CLAUDE_BIN:-claude}"
+PROVIDER_ID="claudebridge"
+MODEL_NAME="${BRIDGE_CODEX_MODEL:-claude-sonnet-5}"
+MODEL_EFFORT="${BRIDGE_CODEX_EFFORT:-low}"
+# Codex sends NO tool definitions for these names (internal code-mode
+# protocol), which leaves the bridge with nothing to offer Claude.
+CODEMODE_MODELS="gpt-6-astra gpt-5.6-luna gpt-5.6-sol gpt-5.6-terra gpt-reserve"
+BEGIN_ROOT="# >>> codex-claude-bridge (root) >>>"
+END_ROOT="# <<< codex-claude-bridge (root) <<<"
+BEGIN_PROV="# >>> codex-claude-bridge (provider) >>>"
+END_PROV="# <<< codex-claude-bridge (provider) <<<"
+DISABLED_PREFIX="#codex-claude-bridge-disabled# "
+
+PORT="${BRIDGE_PORT:-8787}"
+HOST="${BRIDGE_HOST:-127.0.0.1}"
+BASE_URL="http://$HOST:$PORT/v1"
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; B=$'\033[34m'; DIM=$'\033[2m'; BOLD=$'\033[1m'; N=$'\033[0m'
+else
+  R=""; G=""; Y=""; B=""; DIM=""; BOLD=""; N=""
+fi
+
+say()  { printf '%s\n' "$*"; }
+info() { printf '%s==>%s %s\n' "$B" "$N" "$*"; }
+warn() { printf '%swarn:%s %s\n' "$Y" "$N" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+
+FAILED=0; WARNED=0
+pass() { printf '  %s✓%s %-30s %s\n' "$G" "$N" "$1" "${2:-}"; }
+fail() { printf '  %s✗%s %-30s %s\n' "$R" "$N" "$1" "${2:-}"; FAILED=$((FAILED+1)); }
+soft() { printf '  %s!%s %-30s %s\n' "$Y" "$N" "$1" "${2:-}"; WARNED=$((WARNED+1)); }
+hint() { printf '      %s%s%s\n' "$DIM" "$1" "$N"; }
+
+# ── process helpers ──────────────────────────────────────────────────────────
+
+bridge_pid() {
+  [ -f "$PID_FILE" ] || return 1
+  local pid; pid="$(cat "$PID_FILE" 2>/dev/null)"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  printf '%s' "$pid"
+}
+
+port_pid() { lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1; }
+
+health() { curl -fsS --max-time 3 "http://$HOST:$PORT/health" 2>/dev/null; }
+
+wait_healthy() {
+  local i=0
+  while [ $i -lt 40 ]; do
+    health >/dev/null 2>&1 && return 0
+    sleep 0.25; i=$((i+1))
+  done
+  return 1
+}
+
+# ── commands ─────────────────────────────────────────────────────────────────
+
+cmd_start() {
+  mkdir -p "$STATE_DIR"
+  local pid; pid="$(bridge_pid)" && { info "already running (pid $pid)"; return 0; }
+  [ -f "$BRIDGE_JS" ] || die "bridge.mjs not found at $BRIDGE_JS"
+  local squatter; squatter="$(port_pid)"
+  if [ -n "$squatter" ]; then
+    die "port $PORT is held by pid $squatter — stop it or set BRIDGE_PORT to another port"
+  fi
+  info "starting bridge on $BASE_URL"
+  ( cd "$SCRIPT_DIR" && exec nohup node "$BRIDGE_JS" >>"$LOG_FILE" 2>&1 ) &
+  echo $! >"$PID_FILE"
+  if wait_healthy; then
+    pid="$(cat "$PID_FILE")"
+    printf '  %s✓%s running (pid %s)  log: %s\n' "$G" "$N" "$pid" "$LOG_FILE"
+  else
+    fail "bridge did not become healthy"; hint "last log lines:"
+    tail -15 "$LOG_FILE" 2>/dev/null | sed 's/^/      /'
+    rm -f "$PID_FILE"; return 1
+  fi
+}
+
+cmd_stop() {
+  local pid; pid="$(bridge_pid)" || { info "not running"; rm -f "$PID_FILE"; return 0; }
+  info "stopping bridge (pid $pid)"
+  kill "$pid" 2>/dev/null
+  local i=0
+  while [ $i -lt 20 ] && kill -0 "$pid" 2>/dev/null; do sleep 0.2; i=$((i+1)); done
+  kill -0 "$pid" 2>/dev/null && { warn "forcing"; kill -9 "$pid" 2>/dev/null; }
+  rm -f "$PID_FILE"; say "  stopped"
+}
+
+cmd_restart() { cmd_stop; sleep 0.5; cmd_start; }
+
+cmd_run() {
+  [ -f "$BRIDGE_JS" ] || die "bridge.mjs not found at $BRIDGE_JS"
+  local squatter; squatter="$(port_pid)"
+  [ -n "$squatter" ] && die "port $PORT is held by pid $squatter"
+  info "running in foreground (ctrl-c to stop)"
+  cd "$SCRIPT_DIR" && exec node "$BRIDGE_JS"
+}
+
+cmd_status() {
+  local pid h
+  printf '%sbridge%s\n' "$BOLD" "$N"
+  if pid="$(bridge_pid)"; then
+    pass "process" "running (pid $pid)"
+  elif [ -n "$(port_pid)" ]; then
+    soft "process" "port $PORT held by pid $(port_pid) — not started by bridgectl"
+  else
+    soft "process" "not running"
+  fi
+  if h="$(health)"; then pass "health" "$h"; else soft "health" "no response on $BASE_URL"; fi
+  printf '  %-32s %s\n' "log" "$LOG_FILE"
+  printf '  %-32s %s\n' "env overrides" "$([ -f "$ENV_FILE" ] && echo "$ENV_FILE" || echo '(none)')"
+  printf '\n%scodex wiring%s\n' "$BOLD" "$N"
+  if [ -f "$PROFILE_FILE" ]; then
+    pass "profile" "$PROFILE_FILE"
+    hint "use: codex --profile $PROFILE_NAME \"...\""
+  else
+    soft "profile" "not installed"
+  fi
+  if [ -f "$CODEX_CONFIG" ] && grep -q "$BEGIN_PROV" "$CODEX_CONFIG" 2>/dev/null; then
+    pass "global config" "block present in $CODEX_CONFIG"
+  else
+    printf '  %-32s %s\n' "global config" "not modified"
+  fi
+
+}
+
+cmd_logs() {
+  [ -f "$LOG_FILE" ] || die "no log yet at $LOG_FILE"
+  if [ "${1:-}" = "-f" ] || [ "${1:-}" = "--follow" ]; then tail -f "$LOG_FILE"; else tail -n "${1:-80}" "$LOG_FILE"; fi
+}
+
+# ── setup ────────────────────────────────────────────────────────────────────
+# TOML note: bare keys after a [table] header belong to that table, so the root
+# keys must go at the TOP of the file and the provider table at the bottom.
+
+root_block() {
+  printf 'model = "%s"\nmodel_provider = "%s"\nmodel_reasoning_effort = "%s"\nmodel_catalog_json = "%s"\n' "$MODEL_NAME" "$PROVIDER_ID" "$MODEL_EFFORT" "$CLAUDE_CATALOG"
+}
+
+provider_table() {
+  cat <<TOML
+[model_providers.$PROVIDER_ID]
+name = "Claude Bridge"
+base_url = "$BASE_URL"
+wire_api = "responses"
+TOML
+}
+
+# name|claude model|effort   — served by the bridge
+CLAUDE_PROFILES="
+claude|claude-sonnet-5|low
+claude-low|claude-opus-5|low
+claude-medium|claude-opus-5|medium
+claude-high|claude-opus-5|high
+claude-xhigh|claude-opus-5|xhigh
+claude-max|claude-opus-5|max
+claude-sonnet|claude-sonnet-5|medium
+claude-haiku|claude-haiku-4-5|low
+"
+
+# name|codex model|effort    — straight to OpenAI, bridge not involved
+CODEX_PROFILES="
+sol-low|gpt-5.6-sol|low
+sol-medium|gpt-5.6-sol|medium
+sol-high|gpt-5.6-sol|high
+"
+
+# $1 claude model, $2 effort
+claude_profile_toml() {
+  printf 'model = "%s"\nmodel_provider = "%s"\nmodel_reasoning_effort = "%s"\nmodel_catalog_json = "%s"\n\n' "$1" "$PROVIDER_ID" "$2" "$CLAUDE_CATALOG"
+  provider_table
+}
+
+# $1 codex model, $2 effort
+codex_profile_toml() {
+  printf 'model = "%s"\nmodel_provider = "openai"\nmodel_reasoning_effort = "%s"\nmodel_catalog_json = "%s"\n' "$1" "$2" "$OPENAI_CATALOG"
+}
+
+install_catalogs() {
+  [ -f "$CATALOG_JS" ] || die "model-catalog.mjs not found at $CATALOG_JS"
+  node "$CATALOG_JS" >"$CLAUDE_CATALOG.tmp" || die "could not generate Claude model catalog"
+  mv "$CLAUDE_CATALOG.tmp" "$CLAUDE_CATALOG"
+  "$CODEX_BIN" debug models --bundled >"$OPENAI_CATALOG.tmp" || die "could not read Codex's bundled OpenAI catalog"
+  node -e 'const x=JSON.parse(require("fs").readFileSync(process.argv[1])); if (!Array.isArray(x.models) || !x.models.length) process.exit(1)' "$OPENAI_CATALOG.tmp" || die "Codex returned an invalid model catalog"
+  mv "$OPENAI_CATALOG.tmp" "$OPENAI_CATALOG"
+}
+
+install_profiles() {
+  local n=0 line name rest mdl eff
+  for line in $CLAUDE_PROFILES; do
+    name="${line%%|*}"; rest="${line#*|}"; mdl="${rest%%|*}"; eff="${rest#*|}"
+    [ "$name" = claude ] && { mdl="$MODEL_NAME"; eff="$MODEL_EFFORT"; }
+    claude_profile_toml "$mdl" "$eff" > "$CODEX_HOME_DIR/$name.config.toml"; n=$((n+1))
+  done
+  for line in $CODEX_PROFILES; do
+    name="${line%%|*}"; rest="${line#*|}"; mdl="${rest%%|*}"; eff="${rest#*|}"
+    codex_profile_toml "$mdl" "$eff" > "$CODEX_HOME_DIR/$name.config.toml"; n=$((n+1))
+  done
+  say "  installed $n profiles in $CODEX_HOME_DIR"
+}
+
+remove_profiles() {
+  local line name n=0
+  for line in $CLAUDE_PROFILES $CODEX_PROFILES; do
+    name="${line%%|*}"
+    [ -f "$CODEX_HOME_DIR/$name.config.toml" ] && { rm -f "$CODEX_HOME_DIR/$name.config.toml"; n=$((n+1)); }
+  done
+  say "  removed $n profiles"
+}
+
+cmd_profiles() {
+  printf '%sprofile              model                 effort   via%s\n' "$BOLD" "$N"
+  local line name f mdl eff prov rest
+  for line in $CLAUDE_PROFILES $CODEX_PROFILES; do
+    name="${line%%|*}"; f="$CODEX_HOME_DIR/$name.config.toml"
+    [ -f "$f" ] || continue
+    mdl="$(grep -m1 '^model *=' "$f" | sed 's/.*= *"//; s/".*//')"
+    eff="$(grep -m1 '^model_reasoning_effort' "$f" | sed 's/.*= *"//; s/".*//')"
+    grep -q 'model_provider *= *"claudebridge"' "$f" && prov="bridge -> claude" || prov="openai (direct)"
+    printf '  %-20s %-21s %-8s %s\n' "$name" "$mdl" "$eff" "$prov"
+  done
+  printf '\n%s\n' "usage:  codex --profile <name> \"your task\""
+}
+
+provider_block() { root_block; printf '\n'; provider_table; }
+
+# Remove our blocks and re-enable anything we commented out. Idempotent.
+# The blank lines setup puts around its blocks are swallowed too, so setup and
+# use-codex round-trip a config byte for byte however often they are toggled.
+strip_global() {
+  awk -v br="$BEGIN_ROOT" -v er="$END_ROOT" -v bp="$BEGIN_PROV" -v ep="$END_PROV" -v dp="$DISABLED_PREFIX" '
+    function flush() { while (pending > 0) { print ""; pending-- } }
+    $0==br || $0==bp { skip=1; pending=0; next }
+    $0==er || $0==ep { skip=0; eat=1; next }
+    skip { next }
+    /^[ \t]*$/ { if (eat) next; pending++; next }
+    { flush(); eat=0 }
+    index($0, dp)==1 { print substr($0, length(dp)+1); next }
+    { print }
+    END { flush() }
+  ' "$1"
+}
+
+# Comment out the root keys we replace, so uninstall can restore them.
+disable_root_keys() {
+  awk -v dp="$DISABLED_PREFIX" '
+    /^[ \t]*\[/ { intable=1 }
+    !intable && /^[ \t]*(model|model_provider|model_reasoning_effort|model_catalog_json)[ \t]*=/ { print dp $0; next }
+    { print }
+  ' "$1"
+}
+
+cmd_setup() {
+  local global=0
+  case "${1:-}" in --global|-g) global=1 ;; esac
+
+  command -v node  >/dev/null 2>&1 || die "node not found — install Node.js 18+"
+  command -v "$CODEX_BIN" >/dev/null 2>&1 || die "codex not found on PATH"
+  command -v "$CLAUDE_BIN" >/dev/null 2>&1 || warn "claude not found on PATH"
+  [ -f "$BRIDGE_JS" ] || die "bridge.mjs not found at $BRIDGE_JS"
+  mkdir -p "$CODEX_HOME_DIR" "$STATE_DIR"
+  install_catalogs
+  install_profiles
+
+  if [ "$global" -eq 1 ]; then
+    info "installing into $CODEX_CONFIG (makes claude your default codex model)"
+    local tmp="$CODEX_CONFIG.bridge.tmp"
+    if [ -f "$CODEX_CONFIG" ]; then
+      local backup="$CODEX_CONFIG.bak.$(date +%Y%m%d-%H%M%S)"
+      cp "$CODEX_CONFIG" "$backup"; say "  backup: $backup"
+      strip_global "$CODEX_CONFIG" >"$tmp"
+      disable_root_keys "$tmp" >"$tmp.2" && mv "$tmp.2" "$tmp"
+      if grep -q "$DISABLED_PREFIX" "$tmp"; then
+        say "  saved your previous root model/provider/effort/catalog (restored on uninstall)"
+      fi
+    else
+      : >"$tmp"
+    fi
+    {
+      printf '%s\n' "$BEGIN_ROOT"; root_block; printf '%s\n\n' "$END_ROOT"
+      cat "$tmp"
+      printf '\n%s\n' "$BEGIN_PROV"; provider_table; printf '%s\n' "$END_PROV"
+    } >"$CODEX_CONFIG.new" && mv "$CODEX_CONFIG.new" "$CODEX_CONFIG"
+    rm -f "$tmp"
+    say "  wrote provider config"
+    say ""
+    say "  run codex normally:  ${BOLD}codex exec \"your task\" < /dev/null${N}"
+    say "  undo any time:       ${BOLD}$(basename "$0") uninstall${N}"
+  else
+    info "installing codex profiles (your main config stays untouched)"
+    say ""
+    say "  ${BOLD}codex --profile claude \"your task\"${N}        routine default"
+    say "  ${BOLD}codex --profile claude-xhigh \"your task\"${N}  opus 5, xhigh (hard problems)"
+    say "  ${BOLD}codex --profile sol-high \"your task\"${N}      codex gpt-5.6-sol, no bridge"
+    say ""
+    say "  see them all:  ${BOLD}$(basename "$0") profiles${N}"
+  fi
+
+  if [ ! -f "$ENV_FILE" ]; then
+    cat >"$ENV_FILE" <<ENVEOF
+# Sourced by bridgectl. Uncomment what you need.
+# Leave MODEL/EFFORT unset for per-profile selection. Explicit shell BRIDGE_*
+# values override this file. These two values override every requested profile.
+# BRIDGE_CLAUDE_MODEL=sonnet
+# BRIDGE_CLAUDE_EFFORT=low
+# BRIDGE_PORT=8787
+# BRIDGE_MODE=session             # or: stateless
+# BRIDGE_DEBUG=1
+# BRIDGE_CODEX_MODEL=claude-sonnet-5  # default profile and global setup model
+# BRIDGE_CODEX_EFFORT=low
+ENVEOF
+    say "  wrote $ENV_FILE (bridge options)"
+  fi
+
+  say ""
+
+  say "next:  ${BOLD}$(basename "$0") start${N}  then  ${BOLD}$(basename "$0") doctor --quick${N}"
+  say "  /model lists Claude models inside the claude profile. For the app, use setup --global and restart the app; this selects the bridge provider for new tasks."
+}
+
+# Put the main config back on OpenAI. Profiles and the running server are left
+# alone, so this is a cheap toggle rather than an uninstall.
+cmd_use_codex() {
+  info "restoring your own model settings in $CODEX_CONFIG"
+  [ -f "$CODEX_CONFIG" ] || die "no config at $CODEX_CONFIG"
+  if ! grep -qE "codex-claude-bridge" "$CODEX_CONFIG"; then
+    say "  already on your own settings (bridge is not installed globally)"
+    return 0
+  fi
+  local backup="$CODEX_CONFIG.bak.$(date +%Y%m%d-%H%M%S)"
+  cp "$CODEX_CONFIG" "$backup" || die "could not back up $CODEX_CONFIG"
+  strip_global "$CODEX_CONFIG" >"$CODEX_CONFIG.new" || die "could not rewrite $CODEX_CONFIG"
+  mv "$CODEX_CONFIG.new" "$CODEX_CONFIG" || die "could not replace $CODEX_CONFIG"
+  local m; m="$(grep -m1 '^model *=' "$CODEX_CONFIG" | sed 's/.*= *"//; s/".*//')"
+  say "  backup: $backup"
+  say "  main config model: ${m:-(codex default)}"
+  say "  profiles kept — codex --profile $PROFILE_NAME still reaches claude"
+  say "  back to claude:  ${BOLD}$(basename "$0") use-claude${N}  (restart the app after either)"
+}
+
+cmd_uninstall() {
+  info "removing codex wiring"
+  remove_profiles
+  if [ -f "$CODEX_CONFIG" ] && grep -qE "codex-claude-bridge" "$CODEX_CONFIG"; then
+    local backup="$CODEX_CONFIG.bak.$(date +%Y%m%d-%H%M%S)"
+    cp "$CODEX_CONFIG" "$backup"
+    strip_global "$CODEX_CONFIG" >"$CODEX_CONFIG.new" && mv "$CODEX_CONFIG.new" "$CODEX_CONFIG"
+    say "  restored $CODEX_CONFIG (backup: $backup)"
+  fi
+  bridge_pid >/dev/null && cmd_stop
+  say "  done (state kept in $STATE_DIR)"
+}
+
+# ── doctor ───────────────────────────────────────────────────────────────────
+
+cmd_doctor() {
+  local quick=1
+  case "${1:-}" in
+    --live|-l) quick=0 ;;
+    --quick|-q|'') ;;
+    *) die "doctor accepts --quick (default) or --live (spends model usage)" ;;
+  esac
+  FAILED=0; WARNED=0
+
+  printf '%sprerequisites%s\n' "$BOLD" "$N"
+  if command -v node >/dev/null 2>&1; then
+    local nv; nv="$(node --version 2>/dev/null)"
+    local maj; maj="$(printf '%s' "$nv" | sed 's/^v//; s/\..*//')"
+    if [ "${maj:-0}" -ge 18 ] 2>/dev/null; then pass "node" "$nv"; else fail "node" "$nv (need 18+)"; fi
+  else fail "node" "not found"; hint "install Node.js 18 or newer"; fi
+
+  if command -v "$CLAUDE_BIN" >/dev/null 2>&1; then pass "claude cli" "$("$CLAUDE_BIN" --version 2>/dev/null | head -1)"
+  else fail "claude cli" "not found"; hint "the bridge shells out to 'claude' — install Claude Code"; fi
+
+  if command -v "$CODEX_BIN" >/dev/null 2>&1; then pass "codex cli" "$("$CODEX_BIN" --version 2>/dev/null | head -1)"
+  else fail "codex cli" "not found"; fi
+
+  if [ -f "$BRIDGE_JS" ]; then
+    if node --check "$BRIDGE_JS" 2>/dev/null; then pass "bridge.mjs" "syntax ok"
+    else fail "bridge.mjs" "syntax error"; fi
+  else fail "bridge.mjs" "missing at $BRIDGE_JS"; fi
+
+  printf '\n%scodex wiring%s\n' "$BOLD" "$N"
+  local cfg="" where=""
+  if [ -f "$PROFILE_FILE" ]; then cfg="$PROFILE_FILE"; where="profile '$PROFILE_NAME'"
+  elif [ -f "$CODEX_CONFIG" ] && grep -q "$BEGIN_PROV" "$CODEX_CONFIG"; then cfg="$CODEX_CONFIG"; where="global config"; fi
+
+  if [ -n "$cfg" ]; then
+    pass "provider config" "$where"
+    grep -q 'wire_api *= *"responses"' "$cfg" \
+      && pass "wire_api" "responses" \
+      || { fail "wire_api" "must be \"responses\""; hint "codex dropped chat-completions support in Feb 2026"; }
+    local url; url="$(grep -m1 'base_url' "$cfg" | sed 's/.*= *"//; s/".*//')"
+    if [ "$url" = "$BASE_URL" ]; then pass "base_url" "$url"
+    else fail "base_url" "$url != $BASE_URL"; hint "re-run 'setup' after changing BRIDGE_PORT"; fi
+  else
+    fail "provider config" "not installed"; hint "run: $(basename "$0") setup"
+  fi
+  if [ -f "$CLAUDE_CATALOG" ]; then
+    if node -e 'const x=JSON.parse(require("fs").readFileSync(process.argv[1])); if (!x.models?.length || x.models.some(m=>m.visibility!=="list" || m.tool_mode==="code_mode_only")) process.exit(1)' "$CLAUDE_CATALOG" 2>/dev/null; then
+      pass "Claude model catalog" "$CLAUDE_CATALOG"
+    else fail "Claude model catalog" "invalid; re-run setup"; fi
+  else fail "Claude model catalog" "missing; re-run setup to populate /model"; fi
+  [ -n "${BRIDGE_CLAUDE_MODEL:-}" ] && soft "model override" "$BRIDGE_CLAUDE_MODEL overrides all profiles"
+  [ -n "${BRIDGE_CLAUDE_EFFORT:-}" ] && soft "effort override" "$BRIDGE_CLAUDE_EFFORT overrides all profiles"
+
+  if [ -n "$cfg" ]; then
+    local m; m="$(grep -m1 '^model *=' "$cfg" | sed 's/.*= *"//; s/".*//')"
+    case " $CODEMODE_MODELS " in
+      *" $m "*) fail "model name" "$m delivers zero tools"
+                hint "codex uses its internal code-mode protocol for this name, so the"
+                hint "bridge receives no tool definitions. Use claude-via-bridge or gpt-5.5."; ;;
+      *) pass "model name" "$m" ;;
+    esac
+  fi
+  if [ -n "$cfg" ] && grep -q '^env_key' "$cfg"; then
+    soft "env_key" "profile still declares env_key — re-run setup to drop it"
+    hint "codex then demands that variable exists; the bridge never checks auth"
+  fi
+
+  printf '\n%sserver%s\n' "$BOLD" "$N"
+  local pid h; pid="$(bridge_pid)"
+  if [ -n "$pid" ]; then pass "process" "running (pid $pid)"
+  elif [ -n "$(port_pid)" ]; then soft "process" "port $PORT held by pid $(port_pid), not by bridgectl"
+  else fail "process" "not running"; hint "run: $(basename "$0") start"; fi
+
+  if h="$(health)"; then pass "health endpoint" "$h"
+  else fail "health endpoint" "no response on $BASE_URL"; fi
+
+  if [ "$quick" -eq 1 ]; then
+    printf '\n%s(no live inference; use doctor --live for checks that spend model usage)%s\n' "$DIM" "$N"
+  else
+    printf '\n%slive checks%s %s(small model spend)%s\n' "$BOLD" "$N" "$DIM" "$N"
+    if command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
+      local out
+      out="$("$CLAUDE_BIN" -p --model haiku --tools "" --output-format json --max-budget-usd 0.10 \
+              --json-schema '{"type":"object","properties":{"ok":{"type":"string"}},"required":["ok"],"additionalProperties":false}' \
+              'Reply with ok="yes".' </dev/null 2>&1)"
+      if printf '%s' "$out" | grep -q '"structured_output"'; then
+        pass "claude headless" "authenticated, structured output works"
+      elif printf '%s' "$out" | grep -qiE 'not logged in|unauthor|authenticat|login'; then
+        fail "claude headless" "not authenticated"; hint "run: claude  (log in), then retry"
+      else
+        fail "claude headless" "unexpected result"
+        hint "$(printf '%s' "$out" | tail -c 220 | tr '\n' ' ')"
+      fi
+    fi
+
+    if health >/dev/null 2>&1; then
+      local probe
+      probe="$(curl -fsS --max-time 180 -X POST "$BASE_URL/responses" \
+        -H 'Content-Type: application/json' -H 'Accept: text/event-stream' \
+        -d '{"model":"claude-haiku-4-5","stream":true,"prompt_cache_key":"bridgectl-doctor","reasoning":{"effort":"low"},
+             "instructions":"You are a coding agent.",
+             "input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Run the shell command: echo doctor_ok"}]}],
+             "tools":[{"type":"function","name":"exec_command","description":"Run a shell command.",
+                       "parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"],"additionalProperties":false}}]}' 2>&1)"
+      if printf '%s' "$probe" | grep -q '"type":"function_call"'; then
+        pass "end-to-end" "claude returned a codex-shaped function_call"
+      elif printf '%s' "$probe" | grep -q 'response.completed'; then
+        soft "end-to-end" "stream completed but no tool call was emitted"
+        hint "usually a prompting miss, not a wiring fault; check '$(basename "$0") logs'"
+      else
+        fail "end-to-end" "no usable SSE from the bridge"
+        hint "$(printf '%s' "$probe" | tail -c 220 | tr '\n' ' ')"
+      fi
+    fi
+  fi
+
+  printf '\n'
+  if [ "$FAILED" -gt 0 ]; then
+    printf '%s%d check(s) failed%s' "$R" "$FAILED" "$N"
+    [ "$WARNED" -gt 0 ] && printf ', %d warning(s)' "$WARNED"; printf '\n'; return 1
+  elif [ "$WARNED" -gt 0 ]; then
+    printf '%sall critical checks passed, %d warning(s)%s\n' "$Y" "$WARNED" "$N"
+  else
+    printf '%severything looks healthy%s\n' "$G" "$N"
+  fi
+}
+
+cmd_test() {
+  command -v "$CODEX_BIN" >/dev/null 2>&1 || die "codex not found"
+  health >/dev/null 2>&1 || die "bridge is not running — $(basename "$0") start"
+
+  local dir; dir="$(mktemp -d)"
+  info "smoke test in $dir"
+  local args=""
+  [ -f "$PROFILE_FILE" ] && args="--profile $PROFILE_NAME"
+  # shellcheck disable=SC2086
+  "$CODEX_BIN" exec $args --skip-git-repo-check --sandbox workspace-write -C "$dir" \
+    "Create a file proof.txt containing exactly the word WORKING, then cat it." </dev/null 2>&1 | tail -20
+  say ""
+  if [ -f "$dir/proof.txt" ] && grep -q WORKING "$dir/proof.txt"; then
+    printf '  %s✓%s round trip verified — codex executed claude'"'"'s tool call\n' "$G" "$N"
+    rm -rf "$dir"
+  else
+    printf '  %s✗%s proof.txt was not created as expected (kept %s)\n' "$R" "$N" "$dir"; return 1
+  fi
+}
+
+cmd_help() {
+  cat <<HELP
+${BOLD}bridgectl${N} [--codex-home DIR] [--state-dir DIR] — manage the codex ⇄ claude bridge
+
+  ${BOLD}setup${N} [--global]   wire codex up. Default writes a codex profile
+                    ($PROFILE_FILE) and leaves your
+                    main config alone; --global edits ~/.codex/config.toml
+                    (with a backup) and changes your default model.
+  ${BOLD}start${N}             start the server in the background
+  ${BOLD}stop${N}              stop it
+  ${BOLD}restart${N}           stop then start
+  ${BOLD}run${N}               run in the foreground (logs to the terminal)
+  ${BOLD}status${N}            process, health and codex wiring at a glance
+  ${BOLD}profiles${N}          list the installed model/effort profiles
+  ${BOLD}logs${N} [N|-f]       show the last N lines (default 80), or follow
+  ${BOLD}doctor${N} [--live]   local diagnosis; --live adds checks that spend model usage
+  ${BOLD}test${N}              end-to-end smoke test through codex
+  ${BOLD}use-codex${N}         point the main config back at openai (profiles kept)
+  ${BOLD}use-claude${N}        point the main config at the bridge (same as setup --global)
+  ${BOLD}uninstall${N}         remove codex wiring and stop the server
+
+Usage after setup:
+  $(basename "$0") start
+  codex --profile $PROFILE_NAME "your task"
+
+Options live in $ENV_FILE (BRIDGE_CLAUDE_MODEL, BRIDGE_PORT, …).
+Explicit shell BRIDGE_* values take precedence over that file.
+HELP
+}
+
+case "${1:-help}" in
+  setup)     shift; cmd_setup "$@" ;;
+  start)     cmd_start ;;
+  stop)      cmd_stop ;;
+  restart)   cmd_restart ;;
+  run)       cmd_run ;;
+  status)    cmd_status ;;
+  profiles)  cmd_profiles ;;
+  logs)      shift; cmd_logs "$@" ;;
+  doctor)    shift; cmd_doctor "$@" ;;
+  test)      cmd_test ;;
+  use-codex)  cmd_use_codex ;;
+  use-claude) cmd_setup --global ;;
+  uninstall) cmd_uninstall ;;
+  help|-h|--help) cmd_help ;;
+  *) printf '%sunknown command: %s%s\n\n' "$R" "$1" "$N" >&2; cmd_help; exit 1 ;;
+esac
